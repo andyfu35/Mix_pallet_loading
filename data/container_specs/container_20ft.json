@@ -1,0 +1,13 @@
+{
+  "container": {
+    "length": 2.0,
+    "width": 2.35,
+    "height": 2.39,
+    "wall_thickness": 0.05,
+    "pose": [
+      0,
+      0,
+      0
+    ]
+  }
+}
