@@ -5,7 +5,7 @@ class RolloutBuffer:
     def __init__(self):
         self.clear()
 
-    def store(self, state, action, log_prob, reward, done, value):
+    def store(self, state, action, log_prob, reward, done, value, candidates, mask):
         """存一個 step 的資料"""
         self.states.append(state)
         self.actions.append(action)
@@ -13,11 +13,10 @@ class RolloutBuffer:
         self.rewards.append(reward)
         self.dones.append(done)
         self.values.append(value)
+        self.candidates.append(candidates)
+        self.masks.append(mask)
 
     def compute_returns_and_advantages(self, gamma=0.99, lam=0.95):
-        """
-        計算 GAE(λ) Advantage 和 Returns
-        """
         values = self.values + [0]  # bootstrap
         T = len(self.rewards)
 
@@ -36,14 +35,13 @@ class RolloutBuffer:
         self.log_probs = torch.stack(self.log_probs)
         self.advantages = torch.tensor(self.advantages, dtype=torch.float32)
         self.returns = torch.tensor(self.returns, dtype=torch.float32)
+        self.candidates = torch.stack(self.candidates)
+        self.masks = torch.stack(self.masks)
 
-        # Advantage normalization (常用 trick)
+        # Advantage normalization
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
     def get_batches(self, batch_size):
-        """
-        隨機打亂後分成 mini-batches
-        """
         n = len(self.states)
         indices = np.arange(n)
         np.random.shuffle(indices)
@@ -57,6 +55,8 @@ class RolloutBuffer:
                 self.log_probs[batch_idx],
                 self.advantages[batch_idx],
                 self.returns[batch_idx],
+                self.candidates[batch_idx],
+                self.masks[batch_idx],
             )
 
     def clear(self):
@@ -66,5 +66,7 @@ class RolloutBuffer:
         self.rewards = []
         self.dones = []
         self.values = []
+        self.candidates = []
+        self.masks = []
         self.advantages = []
         self.returns = []
