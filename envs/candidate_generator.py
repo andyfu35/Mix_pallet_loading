@@ -3,36 +3,34 @@ import numpy as np
 
 
 class TopViewMap:
-    """
-    Heightmap：每個 cell 存「當前最高頂面 z」。
-    resolution: 每格邊長 (m)。
-    """
     def __init__(self, container_length, container_width, resolution=0.01):
         self.res = float(resolution)
+        self.nx = int(round(container_length / self.res))
+        self.ny = int(round(container_width / self.res))
         self.length = float(container_length)
-        self.width  = float(container_width)
-        self.nx = int(round(self.length  / self.res))
-        self.ny = int(round(self.width   / self.res))
+        self.width = float(container_width)
         self.heightmap = np.zeros((self.ny, self.nx), dtype=np.float32)
 
     def reset(self):
         self.heightmap.fill(0.0)
 
     def update_from_boxes(self, boxes):
-        """
-        把已放箱子的頂面投影到 heightmap（取區域最大值）。
-        """
-        hm, L, W, res = self.heightmap, self.length, self.width, self.res
+        hm = self.heightmap
+        L, W, res = self.length, self.width, self.res
+
         for box in boxes:
-            s = box.get_top_surface()  # {x_min,x_max,y_min,y_max,z(頂面)}
-            z = float(s["z"])
-            x0 = max(0, int((s["x_min"] + L/2) / res))
-            x1 = min(self.nx, int((s["x_max"] + L/2) / res))
-            y0 = max(0, int((s["y_min"] + W/2) / res))
-            y1 = min(self.ny, int((s["y_max"] + W/2) / res))
-            if x0 < x1 and y0 < y1:
-                region = hm[y0:y1, x0:x1]
-                np.maximum(region, z, out=region)
+            surf = box.get_top_surface()
+            z_top = float(surf["z"])
+
+            x_min_idx = max(0, int((surf["x_min"] + L / 2) / res))
+            x_max_idx = min(self.nx, int((surf["x_max"] + L / 2) / res))
+            y_min_idx = max(0, int((surf["y_min"] + W / 2) / res))
+            y_max_idx = min(self.ny, int((surf["y_max"] + W / 2) / res))
+
+            if x_min_idx < x_max_idx and y_min_idx < y_max_idx:
+                region = hm[y_min_idx:y_max_idx, x_min_idx:x_max_idx]
+                # 寫入更高者，避免低高度覆蓋
+                np.maximum(region, z_top, out=region)
 
     def get_heightmap(self):
         return self.heightmap
@@ -40,55 +38,43 @@ class TopViewMap:
 
 class CandidateGenerator:
     """
-    純高度圖候選生成：
-      - 第一顆固定右前角
-      - 之後：必須「前 or 左 or 右」至少一邊貼（牆或同高箱）
-      - 當底面高度 >= h_push 時，做通道檢查：
-          從候選 footprint 的『後緣』(y+wy) 到容器後牆 (ny) 必須淨空
+    僅「靠牆/切齊牆」的候選點生成器：
+      - 左牆：x_idx = 0
+      - 右牆：x_idx = nx - lx_cells
+      - 前牆：y_idx = 0
+    其餘規則：
+      - 以高度圖 region 的 max 當作底面高度 base_height
+      - coverage = (region 在 [base_height±support_tol] 的比例)
+      - AABB 與既有箱體不重疊
+      - 若底面高度 >= h_push，做「前向通道」淨空檢查（沿 +y 方向）
     """
     def __init__(
         self,
         container,
-        resolution=0.01,        # heightmap 解析度（m/格）
-        scan_step_m=0.005,      # 掃描步長（世界座標 m）
-        support_tol=0.02,       # 同層容忍 (±m)
-        contact_tol=None,       # 接觸容忍，若 None 則取 max(resolution, 0.005)
-        h_push=1.4,             # 只在底面高度 >= 此值時做通道檢查
+        resolution=0.01,
+        edge_stride=0.02,     # 沿牆步距（m）
+        support_tol=0.02,     # 視為同層的高差容忍
+        contact_tol=0.01,     # AABB/通道的安全間隙
+        min_coverage=0.5,     # 最小支撐覆蓋率
+        h_push=1.0,           # 低於此底面高度不做前向通道檢查
         require_first_corner=True,
         first_corner="right_front",
-        side_contact_ratio=0.5, # 條帶同層比例門檻（貼邊判定）
-        min_coverage=0.5,       # 支撐率門檻
-        debug=False,
     ):
         self.container = container
         self.res = float(resolution)
         self.top_view = TopViewMap(container.length, container.width, self.res)
 
-        self.scan_step_m = max(1e-4, float(scan_step_m))
+        self.edge_stride = float(edge_stride)
         self.support_tol = float(support_tol)
-        self.contact_tol = float(contact_tol) if contact_tol is not None else max(self.res, 0.005)
+        self.contact_tol = float(contact_tol)
+        self.min_coverage = float(min_coverage)
         self.h_push = float(h_push)
 
         self.require_first_corner = bool(require_first_corner)
         assert first_corner in ("left_back", "left_front", "right_back", "right_front")
         self.first_corner = first_corner
 
-        self.side_contact_ratio = float(side_contact_ratio)
-        self.min_coverage = float(min_coverage)
-        self.debug = bool(debug)
-
-        # ✅ 地板/鄰接條帶的高度門檻：小於這個高度不算“鄰接箱子”
-        #   取 max( 0.5*support_tol, 0.01m )：避免把 z≈0 的地板當成貼邊
-        self.floor_epsilon = max(0.5 * self.support_tol, 0.01)
-        #   條帶若要算“鄰接箱面”，高度必須 >= 這個值
-        self.min_neighbor_z = self.floor_epsilon
-
-    # ---------- 工具 ----------
-
-    @staticmethod
-    def _overlap_1d(a_min, a_max, b_min, b_max):
-        return not (a_max <= b_min or a_min >= b_max)
-
+    # --------- 工具 ---------
     @staticmethod
     def _aabb_overlap(a, b, tol=1e-6):
         return not (
@@ -97,28 +83,24 @@ class CandidateGenerator:
             a["zmax"] <= b["zmin"] + tol or a["zmin"] >= b["zmax"] - tol
         )
 
-    def _first_corner_xy(self, box_l, box_w, pad):
-        """
-        第一顆固定角（預設右前），pad 用於避免浮點貼牆抖動。
-        """
+    def _first_corner_xy(self, box_l, box_w, eps):
         L, W = self.container.length, self.container.width
         fc = self.first_corner
         if fc == "left_back":
-            x0 = -L / 2 + box_l / 2 + pad
-            y0 =  W / 2 - box_w / 2 - pad
+            x0 = -L / 2 + box_l / 2 + eps
+            y0 =  W / 2 - box_w / 2 - eps
         elif fc == "left_front":
-            x0 = -L / 2 + box_l / 2 + pad
-            y0 = -W / 2 + box_w / 2 + pad
+            x0 = -L / 2 + box_l / 2 + eps
+            y0 = -W / 2 + box_w / 2 + eps
         elif fc == "right_back":
-            x0 =  L / 2 - box_l / 2 - pad
-            y0 =  W / 2 - box_w / 2 - pad
+            x0 =  L / 2 - box_l / 2 - eps
+            y0 =  W / 2 - box_w / 2 - eps
         else:  # right_front
-            x0 =  L / 2 - box_l / 2 - pad
-            y0 = -W / 2 + box_w / 2 + pad
+            x0 =  L / 2 - box_l / 2 - eps
+            y0 = -W / 2 + box_w / 2 + eps
         return x0, y0
 
-    # ---------- 主流程 ----------
-
+    # --------- 主流程 ---------
     def update_map(self, boxes):
         self.top_view.reset()
         self.top_view.update_from_boxes(boxes)
@@ -130,165 +112,167 @@ class CandidateGenerator:
 
         box_l, box_w, box_h = float(box.l), float(box.w), float(box.h)
 
-        # ✅ 第一顆箱子固定角
+        # ✅ 第一顆箱子固定角（切齊牆與地板）
         if self.require_first_corner and not placed_boxes:
-            pad = self.res * 0.5
-            x0, y0 = self._first_corner_xy(box_l, box_w, pad)
+            eps = max(self.contact_tol, self.res * 0.5)
+            x0, y0 = self._first_corner_xy(box_l, box_w, eps)
             z0 = box_h / 2
             info0 = {
                 "first_box": True,
                 "coverage": 1.0,
-                "left_contact":  False,
-                "right_contact": True,
-                "front_contact": True,   # 右前角等價於前牆/右牆貼邊
-                "front_clear":   True,
-                "base_height":   0.0,
-                "box_region":    None,
+                "base_height": 0.0,
+                "left_contact": (self.first_corner.startswith("left")),
+                "right_contact": (self.first_corner.startswith("right")),
+                "front_contact": (self.first_corner.endswith("front")),
+                "front_clear": True,
+                "box_region": None,
+                "edge_tag": "first_corner",
             }
             return [(x0, y0, z0, info0)]
 
-        # 常規掃描
-        candidates = []
+        # 更新高度圖
         self.update_map(placed_boxes)
         hm = self.top_view.get_heightmap()
         ny, nx = hm.shape
 
-        step_x_cells = max(1, int(round(self.scan_step_m / res)))
-        step_y_cells = max(1, int(round(self.scan_step_m / res)))
+        # 尺寸轉成 cell
         lx = max(1, int(round(box_l / res)))
         wy = max(1, int(round(box_w / res)))
+        step_cells = max(1, int(round(self.edge_stride / res)))
 
-        # 掃描 footprint
-        for y in range(0, max(1, ny - wy + 1), step_y_cells):
-            for x in range(0, max(1, nx - lx + 1), step_x_cells):
-                region = hm[y:y + wy, x:x + lx]
-                if region.size == 0:
-                    continue
+        candidates = []
 
-                # 支撐率（以區域最大值為 base）
-                base_height = float(region.max())
-                support_mask = (np.abs(region - base_height) <= sup)
-                coverage = float(support_mask.sum()) / float(region.size)
-                if coverage < self.min_coverage:
-                    continue
+        def region_and_metrics(x_idx, y_idx):
+            if x_idx < 0 or y_idx < 0 or x_idx + lx > nx or y_idx + wy > ny:
+                return None, None, None
+            region = hm[y_idx:y_idx + wy, x_idx:x_idx + lx]
+            if region.size == 0:
+                return None, None, None
+            base_h = float(region.max())
+            cov = float((np.abs(region - base_h) <= sup).mean())
+            return region, base_h, cov
 
-                # 世界座標中心
-                x_m = (x * res) - L / 2 + box_l / 2
-                y_m = (y * res) - W / 2 + box_w / 2
-                z_m = base_height + box_h / 2
+        def corridor_clear(x_idx, y_idx, bottom_h):
+            # 只在底面高度 >= h_push 時檢查，方向為 +y（從 footprint 後緣到後牆）
+            if bottom_h < self.h_push - 1e-9:
+                return True
+            y_rear = y_idx + wy
+            if y_rear >= ny:
+                return True
+            corridor = hm[y_rear:ny, x_idx:x_idx + lx]
+            if corridor.size == 0:
+                return True
+            clearance = max(self.support_tol, self.contact_tol)
+            return float(corridor.max()) < (bottom_h - clearance)
 
-                # 高度上限
-                if z_m + box_h / 2 > H + 1e-9:
-                    continue
+        def try_add(x_idx, y_idx, edge_tag, contact_flags):
+            region, base_h, cov = region_and_metrics(x_idx, y_idx)
+            if region is None or cov < self.min_coverage:
+                return
+            z_m = base_h + box_h / 2
+            if z_m + box_h / 2 > H + 1e-9:
+                return
+            bottom_h = z_m - box_h / 2
+            if not corridor_clear(x_idx, y_idx, bottom_h):
+                return
 
-                # ---------- AABB 碰撞（保守） ----------
-                x_min, x_max = x_m - box_l / 2, x_m + box_l / 2
-                y_min, y_max = y_m - box_w / 2, y_m + box_w / 2
-                cand_aabb = {
-                    "xmin": x_min, "xmax": x_max,
-                    "ymin": y_min, "ymax": y_max,
-                    "zmin": z_m - box_h / 2, "zmax": z_m + box_h / 2,
+            # 世界座標中心
+            x_m = (x_idx * res) - L / 2 + box_l / 2
+            y_m = (y_idx * res) - W / 2 + box_w / 2
+
+            # AABB 與既有箱不重疊
+            x_min, x_max = x_m - box_l / 2, x_m + box_l / 2
+            y_min, y_max = y_m - box_w / 2, y_m + box_w / 2
+            cand_aabb = {
+                "xmin": x_min, "xmax": x_max,
+                "ymin": y_min, "ymax": y_max,
+                "zmin": bottom_h, "zmax": z_m + box_h / 2,
+            }
+            for b in placed_boxes:
+                s = b.get_top_surface()
+                b_aabb = {
+                    "xmin": s["x_min"], "xmax": s["x_max"],
+                    "ymin": s["y_min"], "ymax": s["y_max"],
+                    "zmin": s["z"] - b.h, "zmax": s["z"],
                 }
-                overlap = False
-                for b in placed_boxes:
-                    s = b.get_top_surface()
-                    b_aabb = {
-                        "xmin": s["x_min"], "xmax": s["x_max"],
-                        "ymin": s["y_min"], "ymax": s["y_max"],
-                        "zmin": s["z"] - b.h, "zmax": s["z"],
-                    }
-                    if self._aabb_overlap(cand_aabb, b_aabb):
-                        overlap = True
-                        break
-                if overlap:
-                    continue
+                if self._aabb_overlap(cand_aabb, b_aabb):
+                    return
 
-                # ---------- 三向貼邊（牆或同層箱） ----------
-                # 牆用「索引貼牆」判定；貼箱用「高度圖鄰接條帶」比例判定。
-                on_left_wall  = (x == 0)
-                on_right_wall = (x + lx == nx)
-                on_front_wall = (y == 0)
+            info = {
+                "coverage": cov,
+                "base_height": base_h,
+                "left_contact": bool(contact_flags.get("left", False)),
+                "right_contact": bool(contact_flags.get("right", False)),
+                "front_contact": bool(contact_flags.get("front", False)),
+                "front_clear": True if bottom_h < self.h_push else corridor_clear(x_idx, y_idx, bottom_h),
+                "box_region": (x_idx, x_idx + lx, y_idx, y_idx + wy),
+                "edge_tag": edge_tag,
+            }
+            candidates.append((x_m, y_m, z_m, info))
 
-                # 條帶比例：除同層(±sup)外，還需 stripe 高度 >= min_neighbor_z（避免把地板當成鄰接箱）
-                def stripe_ratio_left():
-                    xs = x - 1
-                    if xs < 0 or wy <= 0:
-                        return 0.0
-                    stripe = hm[y:y+wy, xs:xs+1]
-                    same_level = (np.abs(stripe - base_height) <= sup)
-                    occupied   = (stripe >= self.min_neighbor_z)
-                    ok = same_level & occupied
-                    return float(ok.sum()) / float(stripe.size)
+        # ---------------- 牆邊掃描（切齊牆）----------------
+        # 左牆 x_idx=0
+        x_idx = 0
+        for y_idx in range(0, max(1, ny - wy + 1), step_cells):
+            try_add(x_idx, y_idx, "left_wall", {"left": True})
+        # 右牆 x_idx=nx-lx
+        x_idx = max(0, nx - lx)
+        for y_idx in range(0, max(1, ny - wy + 1), step_cells):
+            try_add(x_idx, y_idx, "right_wall", {"right": True})
+        # 前牆 y_idx=0
+        y_idx = 0
+        for x_idx in range(0, max(1, nx - lx + 1), step_cells):
+            try_add(x_idx, y_idx, "front_wall", {"front": True})
 
-                def stripe_ratio_right():
-                    xs = x + lx
-                    if xs >= nx or wy <= 0:
-                        return 0.0
-                    stripe = hm[y:y+wy, xs:xs+1]
-                    same_level = (np.abs(stripe - base_height) <= sup)
-                    occupied   = (stripe >= self.min_neighbor_z)
-                    ok = same_level & occupied
-                    return float(ok.sum()) / float(stripe.size)
+        # ---------------- 箱邊掃描（可選，預設啟用）----------------
+        if getattr(self, "touch_box_edges", True):
+            for b in placed_boxes:
+                s = b.get_top_surface()
+                # footprint 轉 index 範圍
+                bx0 = max(0, int((s["x_min"] + L / 2) / res))
+                bx1 = min(nx, int((s["x_max"] + L / 2) / res))
+                by0 = max(0, int((s["y_min"] + W / 2) / res))
+                by1 = min(ny, int((s["y_max"] + W / 2) / res))
 
-                def stripe_ratio_front():
-                    ys = y - 1
-                    if ys < 0 or lx <= 0:
-                        return 0.0
-                    stripe = hm[ys:ys+1, x:x+lx]
-                    same_level = (np.abs(stripe - base_height) <= sup)
-                    occupied   = (stripe >= self.min_neighbor_z)
-                    ok = same_level & occupied
-                    return float(ok.sum()) / float(stripe.size)
+                # 左邊貼齊：讓新箱 x_max 對齊 s["x_min"] → x_idx = bx0 - lx
+                x_idx = bx0 - lx
+                if x_idx >= 0:
+                    for y_idx in range(by0, max(by0, by1 - wy + 1), step_cells):
+                        try_add(x_idx, y_idx, "touch_left_box", {"left": True})
 
-                # 🚫 第一層（base≈0）時，禁止用條帶判貼邊，避免把“地板=0”當成貼邊
-                if base_height <= self.floor_epsilon:
-                    left_ok  = on_left_wall
-                    right_ok = on_right_wall
-                    front_ok = on_front_wall
-                    left_ratio = right_ratio = front_ratio = 0.0
-                else:
-                    left_ratio  = stripe_ratio_left()
-                    right_ratio = stripe_ratio_right()
-                    front_ratio = stripe_ratio_front()
-                    left_ok  = on_left_wall  or (left_ratio  >= self.side_contact_ratio)
-                    right_ok = on_right_wall or (right_ratio >= self.side_contact_ratio)
-                    front_ok = on_front_wall or (front_ratio >= self.side_contact_ratio)
+                # 右邊貼齊：讓新箱 x_min 對齊 s["x_max"] → x_idx = bx1
+                x_idx = bx1
+                if x_idx + lx <= nx:
+                    for y_idx in range(by0, max(by0, by1 - wy + 1), step_cells):
+                        try_add(x_idx, y_idx, "touch_right_box", {"right": True})
 
-                # 至少一邊要成立
-                if not (left_ok or right_ok or front_ok):
-                    continue
+                # 前邊貼齊：讓新箱 y_max 對齊 s["y_min"] → y_idx = by0 - wy
+                y_idx = by0 - wy
+                if y_idx >= 0:
+                    for x_idx in range(bx0, max(bx0, bx1 - lx + 1), step_cells):
+                        try_add(x_idx, y_idx, "touch_front_box", {"front": True})
 
-                # ---------- 前向通道檢查（沿 +y；僅底面 >= h_push 啟用） ----------
-                bottom_h = z_m - box_h / 2
-                front_clear = True
-                if bottom_h >= self.h_push - 1e-9:
-                    y_rear = y + wy
-                    if y_rear < ny:
-                        corridor = hm[y_rear:ny, x:x+lx]
-                        if corridor.size > 0:
-                            clearance = max(self.support_tol, self.contact_tol)
-                            front_clear = float(corridor.max()) < (bottom_h - clearance)
-                    if not front_clear:
-                        continue
+        return candidates
 
-                info = {
-                    "coverage": coverage,
-                    "base_height": base_height,
-                    "left_contact":  bool(left_ok),
-                    "right_contact": bool(right_ok),
-                    "front_contact": bool(front_ok),
-                    "front_clear":   bool(front_clear),
-                    "box_region": (x, x + lx, y, y + wy),
-                    "left_ratio":  float(left_ratio)  if base_height > self.floor_epsilon else 0.0,
-                    "right_ratio": float(right_ratio) if base_height > self.floor_epsilon else 0.0,
-                    "front_ratio": float(front_ratio) if base_height > self.floor_epsilon else 0.0,
-                }
-                candidates.append((x_m, y_m, z_m, info))
+        # --------- 左牆：x_idx = 0，沿 y 掃描 ---------
+        x_idx = 0
+        for y_idx in range(0, max(1, ny - wy + 1), step_cells):
+            add_candidate(x_idx, y_idx, "left_wall", {"left": True})
+
+        # --------- 右牆：x_idx = nx - lx，沿 y 掃描 ---------
+        x_idx = max(0, nx - lx)
+        for y_idx in range(0, max(1, ny - wy + 1), step_cells):
+            add_candidate(x_idx, y_idx, "right_wall", {"right": True})
+
+        # --------- 前牆：y_idx = 0，沿 x 掃描 ---------
+        y_idx = 0
+        for x_idx in range(0, max(1, nx - lx + 1), step_cells):
+            add_candidate(x_idx, y_idx, "front_wall", {"front": True})
 
         return candidates
 
 
-# ------------------------- 測試主程式 -------------------------
+# ----------------- 測試 -----------------
 if __name__ == "__main__":
     import json
     import random
@@ -296,56 +280,57 @@ if __name__ == "__main__":
     import pybullet_data
     from envs.container_env import ContainerEnv, Box
 
-    # 啟動 GUI
+    # 啟動 PyBullet GUI
     client_id = p.connect(p.GUI)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
-    # 載入貨櫃
+    # 載入貨櫃配置
     with open("data/container_specs/container_20ft.json") as f:
-        cfg = json.load(f)["container"]
+        container_env = json.load(f)
+    container_cfg = container_env["container"]
 
-    container = ContainerEnv(cfg, client_id=client_id)
+    container = ContainerEnv(container_cfg, client_id=client_id)
     container.reset()
 
-    # 建立候選生成器
+    # 只靠牆/切齊牆
     gen = CandidateGenerator(
         container,
-        resolution=0.01,        # 1 cm 高度圖
-        scan_step_m=0.005,      # 5 mm 掃描步長
-        support_tol=0.02,       # ±2 cm 同層容忍
-        contact_tol=0.01,       # 1 cm 接觸容忍（用在通道裕度）
-        h_push=1.0,             # 底面 >= 1.0 m 才檢查通道
-        require_first_corner=True,
-        first_corner="right_front",
-        side_contact_ratio=0.5, # 條帶≥50% 同層且高度>=min_neighbor_z 才算貼邊
+        resolution=0.01,     # 高度圖解析度 1 cm
+        edge_stride=0.02,    # 沿牆步距 2 cm
+        support_tol=0.02,    # 同層容忍 ±2 cm
+        contact_tol=0.01,    # 接觸容忍 1 cm
         min_coverage=0.5,
-        debug=False,
+        h_push=1.0,
+        require_first_corner=True,
+        first_corner="right_front"
     )
 
     placed = []
-    # 放置 40 箱（固定 30cm 立方；可改成隨機尺寸做壓測）
-    for i in range(200):
-        lwh = (0.30, 0.30, 0.30)
-        probe = Box(*lwh, body_id=None, client_id=client_id)
+    for i in range(600):
+        # 測試箱（可改成隨機尺寸）
+        dummy_box = Box(0.30, 0.30, 0.30, body_id=None, client_id=client_id)
 
-        cands = gen.generate(probe, placed)
-        print(f"\nStep {i+1}: 候選數={len(cands)}")
+        cands = gen.generate(dummy_box, placed)
+        print(f"\nStep {i+1}, 候選數量: {len(cands)}")
+
         if not cands:
-            print("⚠️ 沒有候選點，停止")
+            print("⚠️ 沒有候選點，停止放置")
             break
 
-        # 建議：若想鼓勵往上疊，可用 max(..., key=lambda c: c[3]['base_height'])
-        x, y, z, info = random.choice(cands)
-        # x, y, z, info = cands[0]
-        print(f"放置: x={x:.3f}, y={y:.3f}, z={z:.3f}, info={info}")
+        # 隨機選一個候選點
+        idx = random.randrange(len(cands))
+        # idx = 0
+        x, y, z, info = cands[idx]
+        print(f"選擇點[{idx}]: ({x:.3f}, {y:.3f}, {z:.3f}), cov={info['coverage']:.2f}, tag={info['edge_tag']}")
 
-        new_box = Box.spawn(*lwh, pos=(x, y), client_id=client_id)
+        # 生成箱子（z 已是中心高度）
+        new_box = Box.spawn(0.30, 0.30, 0.30, pos=(x, y), client_id=client_id)
         new_box.set_position((x, y, z))
         placed.append(new_box)
 
-        for _ in range(60):
-            p.stepSimulation()
+        # for _ in range(60):
+        #     p.stepSimulation()
 
-    print(f"\n最終放置數：{len(placed)}")
+    print(f"\n最終放置了 {len(placed)} 個箱子")
     while True:
         p.stepSimulation()
