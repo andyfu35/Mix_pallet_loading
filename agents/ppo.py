@@ -1,112 +1,62 @@
-# agents/ppo.py
 import torch
 import torch.nn.functional as F
-from agents.buffer import RolloutBuffer
 
 class PPOAgent:
-    def __init__(self, policy, optimizer,
-                 clip_eps=0.2, gamma=0.99, gae_lambda=0.95,
-                 value_coef=0.5, entropy_coef=0.01,
-                 batch_size=64, n_epochs=10, device=None):
-        """
-        policy: ActorCriticPolicy
-        optimizer: torch.optim.Adam(policy.parameters(), lr=...)
-        """
-        self.policy = policy
-        self.optimizer = optimizer
+    def __init__(self, policy, lr, clip_eps, entropy_coef, value_coef, device, max_grad_norm=0.5):
+        self.policy = policy.to(device)
+        self.opt = torch.optim.Adam(self.policy.parameters(), lr=lr)
         self.clip_eps = clip_eps
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.value_coef = value_coef
         self.entropy_coef = entropy_coef
-        self.batch_size = batch_size
-        self.n_epochs = n_epochs
-        self.device = device or next(policy.parameters()).device
+        self.value_coef = value_coef
+        self.device = device
+        self.max_grad_norm = max_grad_norm
 
-        self.buffer = RolloutBuffer()
+    def update(self, buffer, n_epochs, batch_size):
+        policy_loss_total, value_loss_total, entropy_total, n_batches = 0, 0, 0, 0
+        approx_kl_total = 0.0
 
-    @torch.no_grad()
-    def select_action(self, state, candidates, mask):
-        """
-        state:      [state_dim]            (float32)
-        candidates: [N_fixed, cand_dim]    (float32)  ← 需事先 pad 成固定長度
-        mask:       [N_fixed]              (float32: 1 有效, 0 無效)
-        """
-        # to device + add batch dim
-        state = state.to(self.device).unsqueeze(0)             # [1, S]
-        candidates = candidates.to(self.device).unsqueeze(0)   # [1, N, C]
-        mask = mask.to(self.device).unsqueeze(0) if mask is not None else None  # [1, N]
+        for epoch in range(n_epochs):
+            for states, cands, masks, actions, old_logp, returns, advs, old_values in \
+                    buffer.as_batches(batch_size, self.device):
 
-        action_probs, value = self.policy(state, candidates, mask)  # probs [1, N], value [1, 1]
+                dist, values = self.policy(states, cands, masks)
+                values = values.squeeze(-1).view(-1)   # [B]
+                returns = returns.view(-1)             # [B]
+                advs = advs.view(-1)                   # [B]
+                old_values = old_values.view(-1)       # [B]
 
-        # 保險：避免非常小的概率導致數值問題
-        action_probs = action_probs.clamp(min=1e-8)
-        dist = torch.distributions.Categorical(action_probs)
-
-        action = dist.sample()                    # [1]
-        log_prob = dist.log_prob(action)          # [1]
-
-        # squeeze 成標準形狀
-        action = action.squeeze(0)                # []
-        log_prob = log_prob.squeeze(0)            # []
-        value = value.squeeze(0)                  # [1]
-
-        return int(action.item()), log_prob.detach(), value.detach()
-
-    def update(self):
-        """用 buffer 的資料更新 PPO（假設 train 端已把 candidates/mask 固定長度）"""
-        self.buffer.compute_returns_and_advantages(self.gamma, self.gae_lambda)
-
-        # 確保資料在正確裝置與 dtype
-        states = self.buffer.states.to(self.device)                # [T, S]
-        actions = self.buffer.actions.to(self.device).long()       # [T]
-        old_log_probs = self.buffer.log_probs.to(self.device).float()  # [T]
-        advantages = self.buffer.advantages.to(self.device).float()    # [T]
-        returns = self.buffer.returns.to(self.device).float()          # [T]
-        candidates = self.buffer.candidates.to(self.device).float()    # [T, N, C]
-        masks = self.buffer.masks.to(self.device).float()              # [T, N]
-
-        T = states.size(0)
-        idx = torch.randperm(T, device=self.device)
-
-        for _ in range(self.n_epochs):
-            for start in range(0, T, self.batch_size):
-                end = start + self.batch_size
-                b = idx[start:end]
-
-                b_states = states[b]          # [B, S]
-                b_actions = actions[b]        # [B]
-                b_old_logp = old_log_probs[b] # [B]
-                b_adv = advantages[b]         # [B]
-                b_ret = returns[b]            # [B]
-                b_cands = candidates[b]       # [B, N, C]
-                b_masks = masks[b]            # [B, N]
-
-                # 前向
-                action_probs, values = self.policy(b_states, b_cands, b_masks)  # [B,N], [B,1]
-                action_probs = action_probs.clamp(min=1e-8)
-                dist = torch.distributions.Categorical(action_probs)
-
-                new_logp = dist.log_prob(b_actions)       # [B]
+                new_logp = dist.log_prob(actions)
                 entropy = dist.entropy().mean()
 
-                # 比率
-                ratios = torch.exp(new_logp - b_old_logp) # [B]
+                ratio = torch.exp(new_logp - old_logp)
+                surr1 = ratio * advs
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advs
+                policy_loss = -torch.min(surr1, surr2).mean()
 
-                # 演員損失（clip）
-                surr1 = ratios * b_adv
-                surr2 = torch.clamp(ratios, 1 - self.clip_eps, 1 + self.clip_eps) * b_adv
-                actor_loss = -torch.min(surr1, surr2).mean()
+                v_pred_clipped = old_values + (values - old_values).clamp(-0.2, 0.2)
+                v_loss_unclipped = F.mse_loss(values, returns, reduction="mean")
+                v_loss_clipped   = F.mse_loss(v_pred_clipped, returns, reduction="mean")
+                value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
 
-                # 評論家損失
-                values = values.squeeze(-1)                # [B]
-                critic_loss = F.mse_loss(values, b_ret)
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
-                loss = actor_loss + self.value_coef * critic_loss - self.entropy_coef * entropy
-
-                self.optimizer.zero_grad()
+                self.opt.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)  # 可選，穩定一些
-                self.optimizer.step()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.opt.step()
 
-        self.buffer.clear()
+                with torch.no_grad():
+                    approx_kl = (old_logp - new_logp).mean().clamp_min(0).item()
+
+                policy_loss_total += policy_loss.item()
+                value_loss_total += value_loss.item()
+                entropy_total += entropy.item()
+                approx_kl_total += approx_kl
+                n_batches += 1
+
+        return {
+            "policy_loss": policy_loss_total / n_batches,
+            "value_loss": value_loss_total / n_batches,
+            "entropy": entropy_total / n_batches,
+            "approx_kl": approx_kl_total / n_batches
+        }

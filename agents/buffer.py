@@ -1,75 +1,137 @@
 # agents/buffer.py
 import torch
-import numpy as np
 
 class RolloutBuffer:
-    def __init__(self):
-        self.clear()
+    """
+    支援：
+    - reward normalization：
+        mode='rollout'  → 以當前這一批 rollout 的 reward 做標準化
+        mode='running'  → 跨批次維持 running mean/std 來標準化
+    - advantage normalization：PPO 標配（固定啟用）
+    """
+    def __init__(self, reward_norm=True, reward_norm_mode="rollout"):
+        assert reward_norm_mode in ("rollout", "running")
+        self.reward_norm = reward_norm
+        self.reward_norm_mode = reward_norm_mode
 
-    def store(self, state, action, log_prob, reward, done, value, candidates, mask):
-        self.states.append(state)               # [S]
-        self.actions.append(action)             # int/long
-        self.log_probs.append(log_prob)         # []
-        self.rewards.append(float(reward))      # scalar
-        self.dones.append(float(done))          # 0/1
-        self.values.append(value.squeeze().item())  # 存成 float，避免之後 stack 雜型
-        self.candidates.append(candidates)      # [MAX_CANDS, C]
-        self.masks.append(mask)                 # [MAX_CANDS]
+        # running RMS（僅在 running 模式使用）
+        self._rew_mean = 0.0
+        self._rew_var = 1.0
+        self._rew_count = 1e-4
 
-    def compute_returns_and_advantages(self, gamma=0.99, lam=0.95, last_value=0.0, last_done=1.0):
-        """
-        last_value: rollout 最後一步「下一狀態」的 V(s_{T}) 估計（critic）
-        last_done : 1 if episode ended at the last step, else 0（作為 bootstrap mask）
-        """
-        T = len(self.rewards)
-        values = self.values + [float(last_value)]  # 用 critic 的 bootstrap
-        dones = self.dones + [float(last_done)]
+        self._init_storage()
 
-        advs = [0.0] * T
-        gae = 0.0
-        for t in reversed(range(T)):
-            delta = self.rewards[t] + gamma * values[t+1] * (1 - dones[t]) - values[t]
-            gae = delta + gamma * lam * (1 - dones[t]) * gae
-            advs[t] = gae
-
-        rets = [advs[t] + values[t] for t in range(T)]
-
-        # 轉 tensor
-        self.states = torch.stack(self.states)                       # [T, S]
-        self.actions = torch.tensor(self.actions, dtype=torch.long)  # [T]
-        self.log_probs = torch.stack(self.log_probs).float()         # [T]
-        self.advantages = torch.tensor(advs, dtype=torch.float32)    # [T]
-        self.returns = torch.tensor(rets, dtype=torch.float32)       # [T]
-        self.candidates = torch.stack(self.candidates).float()       # [T, N, C]
-        self.masks = torch.stack(self.masks).float()                 # [T, N]
-
-        # normalize advantages
-        self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
-
-    def get_batches(self, batch_size):
-        n = len(self.states)
-        idx = np.arange(n)
-        np.random.shuffle(idx)
-        for s in range(0, n, batch_size):
-            b = idx[s:s+batch_size]
-            yield (
-                self.states[b],
-                self.actions[b],
-                self.log_probs[b],
-                self.advantages[b],
-                self.returns[b],
-                self.candidates[b],
-                self.masks[b],
-            )
-
-    def clear(self):
+    def _init_storage(self):
         self.states = []
+        self.cand_feats = []
+        self.masks = []
         self.actions = []
-        self.log_probs = []
+        self.logprobs = []
         self.rewards = []
         self.dones = []
         self.values = []
-        self.candidates = []
-        self.masks = []
-        self.advantages = []
         self.returns = []
+        self.advs = []
+
+    def clear(self):
+        # 保留 running 統計，不清空
+        self._init_storage()
+
+    def add(self, state, cand_feats, mask, action, logprob, reward, done, value):
+        self.states.append(state)
+        self.cand_feats.append(cand_feats)
+        self.masks.append(mask)
+        self.actions.append(action)
+        self.logprobs.append(logprob)
+        self.rewards.append(reward)
+        self.dones.append(done)
+        self.values.append(value)
+
+    # --------- running RMS 工具（僅在 reward_norm_mode='running' 用） ---------
+    @torch.no_grad()
+    def _update_reward_rms(self, x: torch.Tensor):
+        """
+        x: [T] 的 rewards（或可用 returns）張量
+        使用並更新 running mean/var（Welford 合併公式）
+        """
+        x = x.float()
+        batch_mean = x.mean()
+        batch_var = x.var(unbiased=False)
+        batch_count = x.numel()
+
+        delta = batch_mean - self._rew_mean
+        tot_count = self._rew_count + batch_count
+
+        new_mean = self._rew_mean + delta * batch_count / tot_count
+        m_a = self._rew_var * self._rew_count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta.pow(2) * self._rew_count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self._rew_mean = new_mean.item()
+        self._rew_var = new_var.item()
+        self._rew_count = tot_count
+
+    def _normalize_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+        if not self.reward_norm:
+            return rewards
+        if self.reward_norm_mode == "rollout":
+            # 用當前這批 rewards 做標準化
+            mean = rewards.mean()
+            std = rewards.std(unbiased=False)
+            return (rewards - mean) / (std + 1e-8)
+        else:
+            # running 模式：先用目前批次更新 RMS，再用更新後的 mean/std 正規化
+            self._update_reward_rms(rewards)
+            mean = torch.tensor(self._rew_mean, dtype=torch.float32, device=rewards.device)
+            std = torch.tensor(self._rew_var, dtype=torch.float32, device=rewards.device).sqrt()
+            return (rewards - mean) / (std + 1e-8)
+
+    # ------------------------------------------------------------------------
+
+    def compute_returns_and_advantages(self, gamma=0.99, gae_lambda=0.95):
+        rewards = torch.tensor(self.rewards, dtype=torch.float32)          # [T]
+        dones   = torch.tensor(self.dones,   dtype=torch.float32)          # [T]
+        values  = torch.stack(self.values).view(-1).float()                # [T]
+
+        # ==== Reward normalization ====
+        rewards = self._normalize_rewards(rewards)
+
+        # ---- GAE ----
+        T = rewards.numel()
+        advs = torch.zeros(T, dtype=torch.float32)
+        gae = 0.0
+        next_value = 0.0  # 遇到 done 時 bootstrap=0（mask 會處理）
+
+        for t in reversed(range(T)):
+            mask = 1.0 - dones[t]
+            delta = rewards[t] + gamma * next_value * mask - values[t]
+            gae = delta + gamma * gae_lambda * mask * gae
+            advs[t] = gae
+            next_value = values[t]
+
+        returns = advs + values.detach()
+
+        # ==== Advantage normalization（PPO 標配）====
+        advs = (advs - advs.mean()) / (advs.std(unbiased=False) + 1e-8)
+
+        self.returns = returns.flatten()
+        self.advs = advs.flatten()
+
+    def as_batches(self, batch_size, device):
+        n = len(self.states)
+        idxs = torch.randperm(n)
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            mb = idxs[start:end]
+
+            yield (
+                torch.stack([self.states[i] for i in mb]).to(device),
+                torch.stack([self.cand_feats[i] for i in mb]).to(device),
+                torch.stack([self.masks[i] for i in mb]).to(device),
+                torch.stack([self.actions[i] for i in mb]).to(device),
+                torch.stack([self.logprobs[i] for i in mb]).to(device),
+                self.returns[mb].to(device).view(-1),
+                self.advs[mb].to(device).view(-1),
+                torch.stack([self.values[i] for i in mb]).detach().to(device).view(-1),
+            )

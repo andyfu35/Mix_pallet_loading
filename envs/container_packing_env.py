@@ -1,155 +1,214 @@
-import gymnasium as gym
+# envs/candidate_generator_virtual_boxes.py
 import numpy as np
-from envs.container_env import ContainerEnv, Box
-from envs.candidate_generator import CandidateGenerator
-from envs.reward_functions import RewardCalculator
+import pybullet as p
 
 
-class ContainerPackingEnv(gym.Env):
-    def __init__(self, cfg, resolution=0.1, client_id=None):
-        super().__init__()
-        if client_id is None:
-            raise RuntimeError("PyBullet client_id 未提供，請先在外部 p.connect() 再傳進來")
+class TopViewMap:
+    def __init__(self, container_length, container_width, resolution=0.01):
+        self.res = float(resolution)
+        self.nx = int(round(container_length / self.res))
+        self.ny = int(round(container_width  / self.res))
+        self.length = float(container_length)
+        self.width  = float(container_width)
+        self.heightmap = np.zeros((self.ny, self.nx), dtype=np.float32)
 
-        self.client_id = client_id
-        self.container = ContainerEnv(cfg, client_id=client_id)
-        self.container.reset()
+    def reset(self):
+        self.heightmap.fill(0.0)
 
-        # 工具
-        self.candidate_gen = CandidateGenerator(self.container, resolution=resolution)
-        self.reward_calc = RewardCalculator(resolution=0.02, wasted_threshold=0.2)
+    def update_from_boxes(self, boxes):
+        hm = self.heightmap
+        L, W, res = self.length, self.width, self.res
+        for box in boxes:
+            surf = box.get_top_surface()
+            z_top = float(surf["z"])
+            x0 = max(0, int((surf["x_min"] + L/2) / res))
+            x1 = min(self.nx, int((surf["x_max"] + L/2) / res))
+            y0 = max(0, int((surf["y_min"] + W/2) / res))
+            y1 = min(self.ny, int((surf["y_max"] + W/2) / res))
+            if x0 < x1 and y0 < y1:
+                region = hm[y0:y1, x0:x1]
+                np.maximum(region, z_top, out=region)
 
-        # 候選點上限（動態 Discrete）
-        self.max_candidates = 100
-        self.action_space = gym.spaces.Discrete(self.max_candidates)
+    def get_heightmap(self):
+        return self.heightmap
 
-        # 狀態空間設計
-        # (1) 當前箱子尺寸 (3 維)
-        # (2) 候選點特徵 (每個候選點 6 維 → x, y, z, coverage, left_support, right_support)
-        # (3) 當前已放置數量 (1 維)
-        obs_dim = 3 + self.max_candidates * 6 + 1
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+
+class CandidateGeneratorVirtualBoxes:
+    def __init__(self, container, resolution=0.02,
+                 support_tol=0.02, min_coverage=0.5,
+                 debug=False):
+        self.container   = container
+        self.res         = float(resolution)
+        self.top_view    = TopViewMap(container.length, container.width, self.res)
+        self.support_tol = float(support_tol)
+        self.min_cov     = float(min_coverage)
+        self.debug       = bool(debug)
+
+    @staticmethod
+    def _aabb_overlap(a, b, tol=1e-6):
+        return not (
+            a["xmax"] <= b["xmin"] + tol or a["xmin"] >= b["xmax"] - tol or
+            a["ymax"] <= b["ymin"] + tol or a["ymin"] >= b["ymax"] - tol or
+            a["zmax"] <= b["zmin"] + tol or a["zmin"] >= b["zmax"] - tol
         )
 
-        # 狀態追蹤
-        self.placed = []
-        self.candidates = []
-        self.current_box = None
-        self.last_waste = 0.0
+    def _region_metrics(self, hm, x_idx, y_idx, lx, wy):
+        ny, nx = hm.shape
+        if x_idx < 0 or y_idx < 0 or x_idx + lx > nx or y_idx + wy > ny:
+            return None, None
+        region = hm[y_idx:y_idx+wy, x_idx:x_idx+lx]
+        if region.size == 0:
+            return None, None
+        base_h = float(region.max())
+        cov    = float((np.abs(region - base_h) <= self.support_tol).mean())
+        return base_h, cov
 
-    def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
+    def _virtual_walls(self, L, W, H):
+        """虛擬四面牆，用極薄 box 表示"""
+        eps = 1e-6
+        return [
+            {"x_min": -L/2, "x_max": -L/2+eps, "y_min": -W/2, "y_max": W/2, "z": H, "id": "wall_left"},
+            {"x_min":  L/2-eps, "x_max":  L/2, "y_min": -W/2, "y_max": W/2, "z": H, "id": "wall_right"},
+            {"y_min": -W/2, "y_max": -W/2+eps, "x_min": -L/2, "x_max": L/2, "z": H, "id": "wall_back"},
+            {"y_min":  W/2-eps, "y_max":  W/2, "x_min": -L/2, "x_max": L/2, "z": H, "id": "wall_front"},
+        ]
 
-        # 清空狀態
-        self.placed = []
-        self.last_waste = 0.0
+    def update_map(self, boxes):
+        self.top_view.reset()
+        self.top_view.update_from_boxes(boxes)
 
-        # 建立虛擬箱子 (不 spawn，只拿尺寸)
-        self.current_box = Box(0.4, 0.4, 0.4, body_id=None, client_id=self.client_id)  # TODO: 可改隨機
+    def generate(self, box, placed_boxes):
+        L, W, H = self.container.length, self.container.width, self.container.height
+        res = self.res
+        self.update_map(placed_boxes)
+        hm  = self.top_view.get_heightmap()
+        ny, nx = hm.shape
 
-        # 生成候選點
-        self.candidates = self.candidate_gen.generate(self.current_box, self.placed)
+        box_l, box_w, box_h = float(box.l), float(box.w), float(box.h)
+        lx = max(1, int(round(box_l / res)))
+        wy = max(1, int(round(box_w / res)))
 
-        return self._get_obs(), {}
+        candidates = []
+        added = set()
 
-    def step(self, action):
-        if action >= len(self.candidates):
-            return self._get_obs(), -1.0, True, False, {"error": "invalid action"}
+        def try_add(x_idx, y_idx, edge_tag, src_id, left=False, right=False, back=False, front=False):
+            key = (x_idx, y_idx, src_id)
+            if key in added:
+                return
+            base_h, cov = self._region_metrics(hm, x_idx, y_idx, lx, wy)
+            if base_h is None or cov < self.min_cov:
+                return
+            z_center = base_h + box_h/2
+            if z_center + box_h/2 > H + 1e-9:
+                return
+            # 世界座標
+            x_center = (x_idx * res) - L/2 + box_l/2
+            y_center = (y_idx * res) - W/2 + box_w/2
+            # 碰撞檢查
+            cand = {"xmin": x_center - box_l/2, "xmax": x_center + box_l/2,
+                    "ymin": y_center - box_w/2, "ymax": y_center + box_w/2,
+                    "zmin": z_center - box_h/2, "zmax": z_center + box_h/2}
+            for b in placed_boxes:
+                s = b.get_top_surface()
+                bb = {"xmin": s["x_min"], "xmax": s["x_max"],
+                      "ymin": s["y_min"], "ymax": s["y_max"],
+                      "zmin": s["z"] - b.h, "zmax": s["z"]}
+                if self._aabb_overlap(cand, bb):
+                    return
+            info = {"base_height": base_h, "coverage": cov,
+                    "left_contact": left, "right_contact": right,
+                    "back_contact": back, "front_contact": front,
+                    "edge_tag": edge_tag, "source": src_id}
+            candidates.append((x_center, y_center, z_center, info))
+            added.add(key)
 
-        # 選定候選點
-        x, y, z, info = self.candidates[action]
-        new_box = Box.spawn(
-            self.current_box.l, self.current_box.w, self.current_box.h,
-            pos=(x, y), client_id=self.client_id, mass=0.0
-        )
-        new_box.set_position((x, y, z))
-        self.placed.append(new_box)
+        # === 把牆壁也當作虛擬箱子 ===
+        all_boxes = []
+        all_boxes.extend(placed_boxes)
+        for wall in self._virtual_walls(L, W, H):
+            dummy = type("Dummy", (), {"get_top_surface": lambda self, d=wall: d, "h": H})()
+            dummy._src_id = wall["id"]
+            all_boxes.append(dummy)
 
-        # --- 計算 flatness ---
-        hm = self.candidate_gen.top_view.get_heightmap()
-        x_min = int((x - self.current_box.l / 2 + self.container.length / 2) / self.candidate_gen.res)
-        x_max = int((x + self.current_box.l / 2 + self.container.length / 2) / self.candidate_gen.res)
-        y_min = int((y - self.current_box.w / 2 + self.container.width / 2) / self.candidate_gen.res)
-        y_max = int((y + self.current_box.w / 2 + self.container.width / 2) / self.candidate_gen.res)
+        # === 對每個 box (牆或真箱) 生成候選 ===
+        for b in all_boxes:
+            s = b.get_top_surface()
+            src_id = getattr(b, "_src_id", id(b))
+            bx0 = int(round((s["x_min"] + L/2) / res))
+            bx1 = int(round((s["x_max"] + L/2) / res))
+            by0 = int(round((s["y_min"] + W/2) / res))
+            by1 = int(round((s["y_max"] + W/2) / res))
 
-        flatness = self.reward_calc.compute_flatness(
-            self.candidate_gen.top_view, (x_min, x_max, y_min, y_max)
-        )
+            # 後邊 (y-)
+            y_idx = by0 - wy
+            if y_idx >= 0:
+                try_add(bx0 - lx, y_idx, "back_left", src_id, left=True, back=True)
+                try_add(bx0,      y_idx, "back", src_id, back=True)
+                try_add(bx1,      y_idx, "back_right", src_id, right=True, back=True)
 
-        # --- 計算 wasted space ---
-        wasted_after = self.reward_calc.compute_wasted_space(self.container, self.candidate_gen.top_view)
+            # 前邊 (y+)
+            y_idx = by1
+            if y_idx + wy <= ny:
+                try_add(bx0 - lx, y_idx, "front_left", src_id, left=True, front=True)
+                try_add(bx0,      y_idx, "front", src_id, front=True)
+                try_add(bx1,      y_idx, "front_right", src_id, right=True, front=True)
 
-        # --- reward ---
-        reward, terminated = self.reward_calc.compute_step_reward(
-            success=True,
-            flatness=flatness,
-            wasted_before=self.last_waste,
-            wasted_after=wasted_after,
-            done=False
-        )
-        self.last_waste = wasted_after
+            # 左邊 (x-)
+            x_idx = bx0 - lx
+            if x_idx >= 0:
+                try_add(x_idx, by0, "left_back", src_id, left=True, back=True)
+                try_add(x_idx, by1 - wy, "left_front", src_id, left=True, front=True)
 
-        truncated = False  # 這裡暫時不用 max_steps，可以在外部控制
+            # 右邊 (x+)
+            x_idx = bx1
+            if x_idx + lx <= nx:
+                try_add(x_idx, by0, "right_back", src_id, right=True, back=True)
+                try_add(x_idx, by1 - wy, "right_front", src_id, right=True, front=True)
 
-        # 下一個箱子 (虛擬，不 spawn)
-        if not terminated:
-            self.current_box = Box(0.4, 0.4, 0.4, body_id=None, client_id=self.client_id)  # TODO: 可改隨機
-            self.candidates = self.candidate_gen.generate(self.current_box, self.placed)
-
-        return self._get_obs(), reward, terminated, truncated, {"candidates": len(self.candidates)}
-
-    def _get_obs(self):
-        # (1) 當前箱子尺寸
-        box_feat = np.array([self.current_box.l, self.current_box.w, self.current_box.h], dtype=np.float32)
-
-        # (2) 候選點特徵
-        cand_feats = []
-        for (x, y, z, info) in self.candidates[:self.max_candidates]:
-            cand_feats.append([
-                x, y, z,
-                info.get("coverage", 0.0),
-                float(info.get("left_support", False)),
-                float(info.get("right_support", False)),
-            ])
-        # padding
-        if len(cand_feats) < self.max_candidates:
-            cand_feats.extend([[0.0] * 6] * (self.max_candidates - len(cand_feats)))
-        cand_feats = np.array(cand_feats, dtype=np.float32).flatten()
-
-        # (3) 已放置數量
-        placed_feat = np.array([len(self.placed)], dtype=np.float32)
-
-        # 合併成最終 observation
-        obs = np.concatenate([box_feat, cand_feats, placed_feat])
-        return obs
+        return candidates
 
 
+# ---------------- 測試 ----------------
 if __name__ == "__main__":
-    import json
-    import pybullet as p
+    import json, random
     import pybullet_data
+    from envs.container_env import ContainerEnv, Box
 
-    # 連線到 PyBullet (用 GUI 模式方便看)
     client_id = p.connect(p.GUI)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
-    # 載入 container 配置
     with open("data/container_specs/container_20ft.json") as f:
-        container_env = json.load(f)
-    container_cfg = container_env["container"]
+        cfg = json.load(f)["container"]
 
-    # 初始化環境
-    env = ContainerPackingEnv(container_cfg, resolution=0.1, client_id=client_id)
-    obs, _ = env.reset()
-    print("初始 observation shape:", obs.shape)
+    container = ContainerEnv(cfg, client_id=client_id)
+    container.reset()
 
-    # 連續執行 5 步
-    for step in range(100):
-        action = np.random.randint(len(env.candidates))  # 隨機挑一個候選點
-        obs, reward, terminated, truncated, info = env.step(action)
-        print(f"Step {step+1}: action={action}, reward={reward:.3f}, terminated={terminated}, obs_shape={obs.shape}")
-        if terminated or truncated:
+    gen = CandidateGeneratorVirtualBoxes(container, resolution=0.05)
+
+    placed = []
+    for step in range(500):
+        # 🎲 隨機尺寸 (0.2–0.6 m)
+        box_l = random.uniform(0.2, 0.6)
+        box_w = random.uniform(0.2, 0.6)
+        box_h = random.uniform(0.2, 0.6)
+        box = Box(box_l, box_w, box_h, body_id=None, client_id=client_id)
+
+        cands = gen.generate(box, placed)
+        print(f"\nStep {step+1}, 候選數量: {len(cands)}")
+        for i, (x, y, z, info) in enumerate(cands[:8]):
+            print(f"[{i}] pos=({x:.2f},{y:.2f},{z:.2f}), tag={info['edge_tag']}, src={info['source']}")
+
+        if not cands:
+            print("⚠️ 沒有候選點")
             break
 
-    p.disconnect(client_id)
+        x, y, z, info = random.choice(cands)
+        new_box = Box.spawn(box_l, box_w, box_h, pos=(x, y), client_id=client_id)
+        new_box.set_position((x, y, z))
+        placed.append(new_box)
+
+        for _ in range(60):
+            p.stepSimulation()
+
+    while True:
+        p.stepSimulation()
